@@ -1,0 +1,92 @@
+from datetime import datetime, timedelta
+from astral import LocationInfo
+from astral.sun import sun
+import math
+
+# ----------------------------------------------------
+# Tide clock configuration
+# ----------------------------------------------------
+
+# A full tide cycle (high -> low -> high) is about 12h 25m
+TIDE_HALF_CYCLE = timedelta(hours=6, minutes=12, seconds=30)
+TIDE_FULL_CYCLE = timedelta(hours=12, minutes=25)
+
+# ----------------------------------------------------
+# Moon phase calculation
+# ----------------------------------------------------
+def moon_phase(date):
+    """Return simple moon phase name for given date."""
+    diff = date - datetime(2001, 1, 1)
+    days = diff.days + (diff.seconds / 86400.0)
+    lunations = 29.53058867
+    phase_index = int((days % lunations) / lunations * 8 + 0.5) % 8
+    phases = [
+        "New Moon",
+        "Waxing Crescent",
+        "First Quarter",
+        "Waxing Gibbous",
+        "Full Moon",
+        "Waning Gibbous",
+        "Last Quarter",
+        "Waning Crescent"
+    ]
+    return phases[phase_index]
+
+# ----------------------------------------------------
+# Tide calculation
+# ----------------------------------------------------
+def tide_status(reference_high_tide, now=None):
+    """
+    Given a reference high tide datetime, compute current tide status
+    and next high/low tides.
+    """
+    if now is None:
+        now = datetime.now()
+
+    # Time since last high tide
+    delta = now - reference_high_tide
+    cycle_minutes = TIDE_FULL_CYCLE.total_seconds() / 60
+    minutes_since = delta.total_seconds() / 60
+    minutes_into_cycle = minutes_since % cycle_minutes
+
+    if minutes_into_cycle < TIDE_HALF_CYCLE.total_seconds() / 60:
+        status = "Falling"
+        next_low = reference_high_tide + TIDE_HALF_CYCLE
+        next_high = reference_high_tide + TIDE_FULL_CYCLE
+    else:
+        status = "Rising"
+        next_high = reference_high_tide + TIDE_FULL_CYCLE
+        next_low = next_high + TIDE_HALF_CYCLE - TIDE_FULL_CYCLE
+
+    return status, next_high, next_low
+
+# ----------------------------------------------------
+# Sunrise / Sunset
+# ----------------------------------------------------
+def get_sun_times(lat, lon, tz):
+    city = LocationInfo(latitude=lat, longitude=lon, timezone=tz)
+    s = sun(city.observer, date=datetime.now(), tzinfo=city.timezone)
+    return s["sunrise"], s["sunset"]
+
+# ----------------------------------------------------
+# Main
+# ----------------------------------------------------
+if __name__ == "__main__":
+    # Example location & reference high tide
+    location_name = "Boston Harbor"
+    lat, lon, tz = 42.35, -71.05, "US/Eastern"
+    reference_high_tide = datetime(2025, 8, 21, 9, 17)  # Example known high tide
+
+    now = datetime.now()
+    status, next_high, next_low = tide_status(reference_high_tide, now)
+    sunrise, sunset = get_sun_times(lat, lon, tz)
+    moon = moon_phase(now)
+
+    print(f"Location: {location_name}")
+    print(f"Current Time: {now}")
+    print(f"Current Tide: {status}")
+    print(f"Next High Tide: {next_high}")
+    print(f"Next Low Tide: {next_low}")
+    print(f"Moon Phase: {moon}")
+    print(f"Sunrise: {sunrise.strftime('%H:%M')}")
+    print(f"Sunset: {sunset.strftime('%H:%M')}")

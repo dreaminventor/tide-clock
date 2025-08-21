@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""
+tide_clock.py — Integrated tide clock with saved locations, sync, and calculations.
+
+Features:
+- Manage multiple locations (custom names) with lat/lon/tz and a reference high tide
+- Sync locations via a user folder (e.g., Dropbox/Drive/iCloud) with conflict resolution
+- Export/Import favorites (JSON/CSV)
+- Calculate current tide status, next tides, moon phase, sunrise/sunset
+- Settings menu and command-line overrides
+
+Dependencies:
+    pip install astral
+"""
+
+import os
+import json
+import csv
+import argparse
+from datetime import datetime, timedelta, timezone
+from astral import LocationInfo
+from astral.sun import sun
+
+# =========================
+# Configuration and paths
+# =========================
+
+SYNC_DIR = os.path.expanduser("~/tide_clock_sync")  # change if desired
+SYNC_FILE = os.path.join(SYNC_DIR, "tide_refs.json")
+LOCAL_FILE = "tide_refs.json"
+CONFIG_FILE = "tide_clock_config.json"
+AUTO_SYNC = True  # auto-write to SYNC_FILE on each save
+
+DEFAULT_CONFIG = {
+    "conflict_mode": "interactive"  # options: local, sync, interactive
+}
+
+# =========================
+# Tide and astronomy config
+# =========================
+
+# Approximate average intervals
+TIDE_HALF_CYCLE = timedelta(hours=6, minutes=12, seconds=30)   # high -> low (or low -> high)
+TIDE_FULL_CYCLE = timedelta(hours=12, minutes=25)              # high -> next high
+
+# =========================
+# Utility helpers
+# =========================
+
+def ensure_sync_dir():
+    if not os.path.exists(SYNC_DIR):
+        os.makedirs(SYNC_DIR)
+    return SYNC_DIR
+
+def load_json(filename):
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_json(data, filename):
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=2)
+
+def iso_to_dt(s):
+    # Accepts "YYYY-MM-DDTHH:MM:SS" or date-only; stores naive local time
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def dt_to_iso(dt):
+    return dt.replace(microsecond=0).isoformat()
+
+def parse_float(s):
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+# =========================
+# Config management
+# =========================
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        return load_json(CONFIG_FILE)
+    else:
+        save_json(DEFAULT_CONFIG, CONFIG_FILE)
+        return DEFAULT_CONFIG
+
+def set_conflict_mode(mode, save=True):
+    cfg = load_config()
+    if mode in ["local", "sync", "interactive"]:
+        cfg["conflict_mode"] = mode
+        if save:
+            save_json(cfg, CONFIG_FILE)
+            print(f"Conflict mode saved as '{mode}'")
+        else:
+            print(f"Conflict mode overridden for this run: '{mode}'")
+        return cfg
+    else:
+        print("Invalid mode. Choose from: local, sync, interactive")
+        return cfg
+
+def settings_menu():
+    cfg = load_config()
+    print("\n=== Tide Clock Settings ===")
+    print(f"Current conflict mode: {cfg.get('conflict_mode', 'interactive')}")
+    print("1. Always prefer local (offline-first)")
+    print("2. Always prefer sync (if available)")
+    print("3. Ask me each time (interactive)")
+    print("4. Cancel")
+
+    choice = input("Select an option: ").strip()
+    if choice == "1":
+        set_conflict_mode("local")
+    elif choice == "2":
+        set_conflict_mode("sync")
+    elif choice == "3":
+        set_conflict_mode("interactive")
+    else:
+        print("No changes made.")
+
+# =========================
+# Input wrapper with !settings
+# =========================
+
+def user_input_with_settings(prompt, default=None):
+    response = input(prompt).strip()
+
+    if response.lower() == "!settings":
+        settings_menu()
+        return user_input_with_settings(prompt, default)
+
+    if response == "" and default is not None:
+        print(f"(default: {default})")
+        return str(default)
+
+    return response
+
+# =========================
+# Sync and conflict resolution
+# =========================
+
+def resolve_conflict(key, local_value, sync_value, mode):
+    if mode == "local":
+        return local_value
+    elif mode == "sync":
+        return sync_value
+    elif mode == "interactive":
+        while True:
+            print(f"\nConflict detected for location '{key}':")
+            print("Local version:", local_value)
+            print("Sync version: ", sync_value)
+            print("Options: (l)ocal | (s)ync | (m)erge | (c)hange settings | (q)uit conflict resolution")
+            choice = user_input_with_settings("Your choice: ").lower()
+
+            if choice == "l":
+                return local_value
+            if choice == "s":
+                return sync_value
+            if choice == "m":
+                merged = local_value.copy()
+                cfg = load_config()
+                default_mode = cfg.get("conflict_mode", "interactive")
+                default_choice = "l" if default_mode == "local" else "s" if default_mode == "sync" else None
+
+                for field in set(list(local_value.keys()) + list(sync_value.keys())):
+                    lv = local_value.get(field)
+                    sv = sync_value.get(field)
+                    if lv != sv:
+                        use = user_input_with_settings(
+                            f"Field '{field}': local='{lv}' vs sync='{sv}'. Use (l)ocal or (s)ync"
+                            + (f" [default={default_choice}]" if default_choice else "")
+                            + "? ",
+                            default=default_choice
+                        ).lower()
+                        if use == "s":
+                            merged[field] = sv
+                        else:
+                            merged[field] = lv
+                return merged
+            if choice == "c":
+                settings_menu()
+                cfg = load_config()
+                new_mode = cfg.get("conflict_mode", "interactive")
+                if new_mode != "interactive":
+                    print(f"Switching to '{new_mode}' mode for remaining conflicts.")
+                    return resolve_conflict(key, local_value, sync_value, new_mode)
+                else:
+                    print("Still in interactive mode, continuing.")
+            if choice == "q":
+                print("Keeping local version.")
+                return local_value
+            print("Invalid choice.")
+    else:
+        return local_value
+
+def merge_dicts(local_refs, sync_refs, mode):
+    merged = local_refs.copy()
+    for key, value in sync_refs.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            if merged[key] != value:
+                merged[key] = resolve_conflict(key, merged[key], value, mode)
+    return merged
+
+def save_refs(refs, filename=LOCAL_FILE):
+    save_json(refs, filename)
+    print(f"Saved {len(refs)} locations to {filename}")
+
+    if AUTO_SYNC:
+        ensure_sync_dir()
+        save_json(refs, SYNC_FILE)
+        print(f"(Auto-synced {len(refs)} locations to {SYNC_FILE})")
+
+def load_refs(mode_override=None):
+    cfg = load_config()
+    mode = mode_override or cfg.get("conflict_mode", "interactive")
+
+    local_refs = load_json(LOCAL_FILE)
+    sync_refs = load_json(SYNC_FILE) if os.path.exists(SYNC_FILE) else {}
+
+    merged = merge_dicts(local_refs, sync_refs, mode)
+
+    if merged != local_refs or merged != sync_refs:
+        save_refs(merged)
+        print("Two-way sync applied.")
+    else:
+        print("Refs loaded and already in sync.")
+
+    return merged
+
+# =========================
+# Export / Import
+# =========================
+
+def export_locations(refs, filename="tide_refs_export.json", use_sync=False):
+    if use_sync:
+        ensure_sync_dir()
+        filename = os.path.join(SYNC_DIR, filename)
+
+    if filename.endswith(".json"):
+        with open(filename, "w") as f:
+            json.dump(refs, f, indent=2)
+        print(f"Exported {len(refs)} locations to {filename}")
+
+    elif filename.endswith(".csv"):
+        with open(filename, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["name", "lat", "lon", "tz", "reference_high_tide"])
+            for key, val in refs.items():
+                writer.writerow([
+                    key,
+                    val.get("lat", ""),
+                    val.get("lon", ""),
+                    val.get("tz", ""),
+                    val.get("reference_high_tide", "")
+                ])
+        print(f"Exported {len(refs)} locations to {filename}")
+    else:
+        print("Unsupported file type. Use .json or .csv")
+
+def import_locations(refs, filename="tide_refs_export.json", use_sync=False):
+    if use_sync:
+        ensure_sync_dir()
+        filename = os.path.join(SYNC_DIR, filename)
+
+    if not os.path.exists(filename):
+        print(f"File {filename} not found.")
+        return refs
+
+    merged = refs.copy()
+
+    if filename.endswith(".json"):
+        with open(filename, "r") as f:
+            new_refs = json.load(f)
+        for key, value in new_refs.items():
+            if key not in merged:
+                merged[key] = value
+            else:
+                print(f"Skipping duplicate by name: {key}")
+        print(f"Imported {len(new_refs)} JSON locations.")
+
+    elif filename.endswith(".csv"):
+        with open(filename, "r") as f:
+            reader = csv.DictReader(f)
+            new_refs = {}
+            for row in reader:
+                name = row["name"].strip()
+                new_refs[name] = {
+                    "lat": parse_float(row.get("lat", "")),
+                    "lon": parse_float(row.get("lon", "")),
+                    "tz": row.get("tz", "").strip(),
+                    "reference_high_tide": row.get("reference_high_tide", "").strip()
+                }
+            for key, value in new_refs.items():
+                if key not in merged:
+                    merged[key] = value
+                else:
+                    print(f"Skipping duplicate by name: {key}")
+        print(f"Imported {len(new_refs)} CSV locations.")
+    else:
+        print("Unsupported file type. Use .json or .csv")
+
+    save_refs(merged)
+    print(f"Total saved locations: {len(merged)}")
+    return merged
+
+# =========================
+# Location management menu
+# =========================
+
+def add_or_update_location(refs):
+    name = user_input_with_settings("Location name (mask): ").strip()
+    if not name:
+        print("Name is required.")
+        return refs
+
+    lat = parse_float(user_input_with_settings("Latitude (e.g. 42.35): "))
+    lon = parse_float(user_input_with_settings("Longitude (e.g. -71.05): "))
+    tz = user_input_with_settings("Timezone (e.g. US/Eastern): ")
+
+    rht_input = user_input_with_settings("Reference high tide ISO (YYYY-MM-DDTHH:MM[:SS]) or blank to skip: ")
+    rht = iso_to_dt(rht_input) if rht_input else None
+
+    entry = refs.get(name, {})
+    if lat is not None:
+        entry["lat"] = lat
+    if lon is not None:
+        entry["lon"] = lon
+    if tz:
+        entry["tz"] = tz
+    if rht:
+        entry["reference_high_tide"] = dt_to_iso(rht)
+
+    refs[name] = entry
+    save_refs(refs)
+    print(f"Saved location '{name}'.")
+    return refs
+
+def rename_location(refs):
+    keys = list(refs.keys())
+    if not keys:
+        print("No locations to rename.")
+        return refs
+    for i, k in enumerate(keys,  start=1):
+        print(f"{i}. {k}")
+    choice = user_input_with_settings("Enter number to rename: ")
+    if not choice.isdigit() or not (1 <= int(choice) <= len(keys)):
+        print("Invalid selection.")
+        return refs
+    old_key = keys[int(choice)-1]
+    new_key = user_input_with_settings(f"New name for '{old_key}': ").strip()
+    if not new_key or new_key in refs:
+        print("Invalid or duplicate name.")
+        return refs
+    refs[new_key] = refs.pop(old_key)
+    save_refs(refs)
+    print(f"Renamed '{old_key}' to '{new_key}'.")
+    return refs
+
+def delete_location(refs):
+    keys = list(refs.keys())
+    if not keys:
+        print("No locations to delete.")
+        return refs
+    for i, k in enumerate(keys, start=1):
+        print(f"{i}. {k}")
+    choice = user_input_with_settings("Enter number to delete: ")
+    if not choice.isdigit() or not (1 <= int(choice) <= len(keys)):
+        print("Invalid selection.")
+        return refs
+    key = keys[int(choice)-1]
+    confirm = user_input_with_settings(f"Delete '{key}'? (y/n): ").lower()
+    if confirm == "y":
+        del refs[key]
+        save_refs(refs)
+        print(f"Deleted '{key}'.")
+    return refs
+
+def pick_location(refs):
+    if not refs:
+        print("No saved locations yet.")
+        return None
+
+    while True:
+        print("\nSaved Locations:")
+        keys = list(refs.keys())
+        for i, key in enumerate(keys, start=1):
+            v = refs[key]
+            print(f"{i}. {key}  lat={v.get('lat')} lon={v.get('lon')} tz={v.get('tz')} ref_high={v.get('reference_high_tide','')}")
+        print("\nOptions:")
+        print(" [N] New Location")
+        print(" [D] Delete a Location")
+        print(" [R] Rename a Location")
+        print(" [E] Export Locations")
+        print(" [I] Import Locations")
+        print(" [S] Settings")
+        print(" [Q] Back")
+
+        choice = user_input_with_settings("Choose option or location number: ").strip().lower()
+
+        if choice.isdigit() and 1 <= int(choice) <= len(keys):
+            return keys[int(choice) - 1]
+        elif choice == "n":
+            add_or_update_location(refs)
+        elif choice == "d":
+            delete_location(refs)
+        elif choice == "r":
+            rename_location(refs)
+        elif choice == "e":
+            filename = user_input_with_settings("Export filename [.json or .csv] (default tide_refs_export.json): ", "tide_refs_export.json")
+            sync = user_input_with_settings("Save in sync folder? (y/n): ", "n").lower() == "y"
+            export_locations(refs, filename, use_sync=sync)
+        elif choice == "i":
+            filename = user_input_with_settings("Import filename [.json or .csv] (default tide_refs_export.json): ", "tide_refs_export.json")
+            sync = user_input_with_settings("Load from sync folder? (y/n): ", "n").lower() == "y"
+            refs = import_locations(refs, filename, use_sync=sync)
+        elif choice == "s":
+            settings_menu()
+        elif choice == "q":
+            return None
+        else:
+            print("Invalid option.")
+
+# =========================
+# Astronomy and tides
+# =========================
+
+def moon_phase(dt):
+    # Simple 8-phase model
+    base = datetime(2001, 1, 1)
+    days = (dt - base).days + ((dt - base).seconds / 86400.0)
+    lunations = 29.53058867
+    phase_index = int((days % lunations) / lunations * 8 + 0.5) % 8
+    phases = [
+        "New Moon",
+        "Waxing Crescent",
+        "First Quarter",
+        "Waxing Gibbous",
+        "Full Moon",
+        "Waning Gibbous",
+        "Last Quarter",
+        "Waning Crescent"
+    ]
+    return phases[phase_index]
+
+def get_sun_times(lat, lon, tz):
+    city = LocationInfo(latitude=lat, longitude=lon, timezone=tz)
+    s = sun(city.observer, date=datetime.now(), tzinfo=city.timezone)
+    return s["sunrise"], s["sunset"]
+
+def tide_status(reference_high_tide, now=None):
+    if now is None:
+        now = datetime.now()
+    cycle_minutes = TIDE_FULL_CYCLE.total_seconds() / 60
+    minutes_since = (now - reference_high_tide).total_seconds() / 60
+    minutes_into_cycle = minutes_since % cycle_minutes
+
+    half_minutes = TIDE_HALF_CYCLE.total_seconds() / 60
+    if minutes_into_cycle < half_minutes:
+        status = "Falling"
+        next_low = reference_high_tide + TIDE_HALF_CYCLE
+        next_high = reference_high_tide + TIDE_FULL_CYCLE
+    else:
+        status = "Rising"
+        # time since the last low is minutes_into_cycle - half_minutes
+        # next low is at reference_high + full + half - cycle
+        next_high = reference_high_tide + TIDE_FULL_CYCLE
+        next_low = next_high + TIDE_HALF_CYCLE - TIDE_FULL_CYCLE
+    return status, next_high, next_low
+
+def upcoming_tides(reference_high_tide, count=4, now=None):
+    """
+    Produce a list of upcoming tide events (High/Low, time), starting after 'now'.
+    We iterate from the reference high tide in half-cycle steps.
+    """
+    if now is None:
+        now = datetime.now()
+    events = []
+    # The reference event is High Tide at reference_high_tide. Alternate every half-cycle.
+    # Step forward until after now, then collect 'count' events.
+    t = reference_high_tide
+    is_high = True
+    # Fast-forward
+    while t <= now and len(events) < 1000:
+        t += TIDE_HALF_CYCLE
+        is_high = not is_high
+    # Collect
+    while len(events) < count:
+        events.append(("High" if is_high else "Low", t))
+        t += TIDE_HALF_CYCLE
+        is_high = not is_high
+    return events
+
+# =========================
+# Calculation runner
+# =========================
+
+def run_tide_clock_for_location(name, entry, output_json=False):
+    missing = [k for k in ["lat", "lon", "tz", "reference_high_tide"] if k not in entry or not entry.get(k)]
+    if missing:
+        print(f"Location '{name}' is missing fields: {', '.join(missing)}")
+        return None
+
+    lat = float(entry["lat"])
+    lon = float(entry["lon"])
+    tz = entry["tz"]
+    ref_dt = iso_to_dt(entry["reference_high_tide"])
+    if ref_dt is None:
+        print(f"Invalid reference_high_tide for '{name}': {entry.get('reference_high_tide')}")
+        return None
+
+    now = datetime.now()
+    status, next_high, next_low = tide_status(ref_dt, now)
+    events = upcoming_tides(ref_dt, count=4, now=now)
+    sunrise, sunset = get_sun_times(lat, lon, tz)
+    phase = moon_phase(now)
+
+    if output_json:
+        payload = {
+            "location": name,
+            "now": dt_to_iso(now),
+            "lat": lat,
+            "lon": lon,
+            "tz": tz,
+            "reference_high_tide": entry["reference_high_tide"],
+            "status": status,
+            "next_high": dt_to_iso(next_high),
+            "next_low": dt_to_iso(next_low),
+            "upcoming": [{"type": t, "time": dt_to_iso(ts)} for (t, ts) in events],
+            "sunrise": dt_to_iso(sunrise),
+            "sunset": dt_to_iso(sunset),
+            "moon_phase": phase
+        }
+        print(json.dumps(payload, indent=2))
+        return payload
+
+    # Human-readable
+    print("\n======================")
+    print(f"Location: {name}")
+    print(f"Now: {now.strftime('%Y-%m-%d %H:%M')}")
+    print(f"Tide: {status}")
+    print(f"Next High Tide: {next_high.strftime('%Y-%m-%d %H:%M')}")
+    print(f"Next Low Tide: {next_low.strftime('%Y-%m-%d %H:%M')}")
+    print(f"Moon Phase: {phase}")
+    print(f"Sunrise: {sunrise.strftime('%H:%M')}   Sunset: {sunset.strftime('%H:%M')}")
+    print("Upcoming:")
+    for ttype, ttime in events:
+        print(f"  {ttype}: {ttime.strftime('%Y-%m-%d %H:%M')}")
+    print("======================\n")
+    return True
+
+# =========================
+# CLI entry and main menu
+# =========================
+
+def main():
+    parser = argparse.ArgumentParser(description="Tide Clock (locations + sync + calculations)")
+    parser.add_argument("--mode", choices=["local", "sync", "interactive"], help="Override conflict resolution mode for this run")
+    parser.add_argument("--settings", action="store_true", help="Open settings menu")
+    parser.add_argument("--list", action="store_true", help="List saved locations and exit")
+    parser.add_argument("--location", help="Run tide clock for a specific saved location name")
+    parser.add_argument("--json", action="store_true", help="Output JSON instead of human-readable text")
+    args = parser.parse_args()
+
+    if args.settings:
+        settings_menu()
+        return
+
+    if args.mode:
+        set_conflict_mode(args.mode, save=False)
+
+    refs = load_refs(mode_override=args.mode)
+
+    if args.list:
+        print("Saved locations:")
+        for k in refs.keys():
+            print(f" - {k}")
+        return
+
+    chosen = args.location
+    if not chosen:
+        # Interactive chooser
+        chosen = pick_location(refs)
+        if chosen is None:
+            # If user backed out, offer to add a location or exit
+            add_new = user_input_with_settings("Add a new location now? (y/n): ", "n").lower()
+            if add_new == "y":
+                refs = add_or_update_location(refs)
+            else:
+                return
+
+    if chosen not in refs:
+        print(f"Location '{chosen}' not found.")
+        return
+
+    run_tide_clock_for_location(chosen, refs[chosen], output_json=args.json)
+
+if __name__ == "__main__":
+    main()

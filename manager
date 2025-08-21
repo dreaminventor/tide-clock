@@ -1,0 +1,196 @@
+import os
+import json
+
+# --- File paths ---
+SYNC_DIR = os.path.expanduser("~/tide_clock_sync")
+SYNC_FILE = os.path.join(SYNC_DIR, "tide_refs.json")
+LOCAL_FILE = "tide_refs.json"
+CONFIG_FILE = "tide_clock_config.json"
+AUTO_SYNC = True
+
+# --- Default configuration ---
+DEFAULT_CONFIG = {
+    "conflict_mode": "interactive"  # options: local, sync, interactive
+}
+
+# ----------------------------
+# Utility functions
+# ----------------------------
+
+def ensure_sync_dir():
+    if not os.path.exists(SYNC_DIR):
+        os.makedirs(SYNC_DIR)
+    return SYNC_DIR
+
+def load_json(filename):
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_json(data, filename):
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ----------------------------
+# Config management
+# ----------------------------
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        return load_json(CONFIG_FILE)
+    else:
+        save_json(DEFAULT_CONFIG, CONFIG_FILE)
+        return DEFAULT_CONFIG
+
+def set_conflict_mode(mode):
+    cfg = load_config()
+    if mode in ["local", "sync", "interactive"]:
+        cfg["conflict_mode"] = mode
+        save_json(cfg, CONFIG_FILE)
+        print(f"Conflict mode set to '{mode}'")
+    else:
+        print("Invalid mode. Choose from: local, sync, interactive")
+
+def settings_menu():
+    cfg = load_config()
+    print("\n=== Tide Clock Settings ===")
+    print(f"Current conflict mode: {cfg.get('conflict_mode', 'interactive')}")
+    print("1. Always prefer local (offline-first)")
+    print("2. Always prefer sync (if available)")
+    print("3. Ask me each time (interactive)")
+    print("4. Cancel")
+
+    choice = input("Select an option: ").strip()
+    if choice == "1":
+        set_conflict_mode("local")
+    elif choice == "2":
+        set_conflict_mode("sync")
+    elif choice == "3":
+        set_conflict_mode("interactive")
+    else:
+        print("No changes made.")
+
+# ----------------------------
+# Interactive input wrapper
+# ----------------------------
+
+def user_input_with_settings(prompt, default=None):
+    """Input wrapper that allows '!settings' and default choice via Enter."""
+    response = input(prompt).strip().lower()
+
+    if response == "!settings":
+        settings_menu()
+        cfg = load_config()
+        return user_input_with_settings(prompt, default)  # re-ask after settings
+
+    if response == "" and default:  # user pressed Enter, use default
+        print(f"(default: {default})")
+        return default
+
+    return response
+
+# ----------------------------
+# Conflict resolution
+# ----------------------------
+
+def resolve_conflict(key, local_value, sync_value, mode):
+    if mode == "local":
+        return local_value
+    elif mode == "sync":
+        return sync_value
+    elif mode == "interactive":
+        while True:
+            print(f"\nConflict detected for location '{key}':")
+            print("Local version:", local_value)
+            print("Sync version: ", sync_value)
+            print("Options: (l)ocal | (s)ync | (m)erge | (c)hange settings | (q)uit conflict resolution")
+            choice = user_input_with_settings("Your choice: ")
+
+            if choice == "s":
+                return sync_value
+            elif choice == "m":
+                merged = local_value.copy()
+                cfg = load_config()
+                default_mode = cfg.get("conflict_mode", "interactive")
+                default_choice = "l" if default_mode == "local" else "s" if default_mode == "sync" else None
+
+                for field in sync_value:
+                    if field not in merged or merged[field] != sync_value[field]:
+                        use = user_input_with_settings(
+                            f"Field '{field}': local='{local_value.get(field)}', "
+                            f"sync='{sync_value.get(field)}'. Use (l)ocal or (s)ync"
+                            + (f" [default={default_choice}]" if default_choice else "")
+                            + "? ",
+                            default=default_choice
+                        )
+                        if use == "s":
+                            merged[field] = sync_value[field]
+                        # if use == "l" or Enter+default=l, keep local
+                return merged
+            elif choice == "c":
+                settings_menu()
+                cfg = load_config()
+                new_mode = cfg.get("conflict_mode", "interactive")
+                if new_mode != "interactive":
+                    print(f"Switching to '{new_mode}' mode for remaining conflicts.")
+                    return resolve_conflict(key, local_value, sync_value, new_mode)
+                else:
+                    print("Still in interactive mode, continuing.")
+            elif choice == "q":
+                print("Skipping conflict resolution; keeping local by default.")
+                return local_value
+            else:
+                return local_value
+    else:
+        return local_value  # fallback
+
+def merge_dicts(local_refs, sync_refs, mode):
+    merged = local_refs.copy()
+    for key, value in sync_refs.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            if merged[key] != value:
+                merged[key] = resolve_conflict(key, merged[key], value, mode)
+    return merged
+
+# ----------------------------
+# Ref management (load + save)
+# ----------------------------
+
+def load_refs():
+    cfg = load_config()
+    mode = cfg.get("conflict_mode", "interactive")
+
+    local_refs = load_json(LOCAL_FILE)
+    sync_refs = load_json(SYNC_FILE) if os.path.exists(SYNC_FILE) else {}
+
+    merged = merge_dicts(local_refs, sync_refs, mode)
+
+    if merged != local_refs or merged != sync_refs:
+        save_refs(merged)
+        print("Two-way sync applied.")
+    else:
+        print("Refs loaded and already in sync.")
+
+    return merged
+
+def save_refs(refs, filename=LOCAL_FILE):
+    save_json(refs, filename)
+    print(f"Saved {len(refs)} locations to {filename}")
+
+    if AUTO_SYNC:
+        ensure_sync_dir()
+        save_json(refs, SYNC_FILE)
+        print(f"(Auto-synced {len(refs)} locations to {SYNC_FILE})")
+
+# ----------------------------
+# Example usage
+# ----------------------------
+
+if __name__ == "__main__":
+    refs = load_refs()
+    print("\nCurrent locations:", list(refs.keys()))
+    # Example: refs["Boston Harbor"] = {"timezone": "EST", "lat": 42.35, "lon": -71.05}
+    save_refs(refs)
